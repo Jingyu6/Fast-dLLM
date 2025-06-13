@@ -6,7 +6,7 @@ from generate import (generate, generate_with_dual_cache,
                       generate_with_prefix_cache)
 from model.modeling_llada import LLaDAModelLM
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 
 def single_inference(
@@ -29,8 +29,20 @@ def single_inference(
 def main(args):
     # model init
     device = 'cuda'
-    model = LLaDAModelLM.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
+    if args.model_type == "llada":
+        model = LLaDAModelLM.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
+        tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
+    elif args.model_type == "llama":
+        model = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-3.1-8B-Instruct", 
+            trust_remote_code=True, 
+            torch_dtype=torch.bfloat16, 
+        ).to(device).eval()
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+        tokenizer.pad_token = tokenizer.eos_token
+        model = pipeline(task="text-generation", model=model, tokenizer=tokenizer)
+    else:
+        raise ValueError(f"Unknown model type {args.model}")
 
     m = [{"role": "user", "content": args.prompt}]
     user_input = tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
@@ -39,11 +51,16 @@ def main(args):
 
     torch.cuda.synchronize()
     for _ in tqdm(range(args.warmup), "Warmup..."):
-        single_inference(
-            model, tokenizer, 
-            args.use_cache, args.if_cache_position, 
-            prompt, args.steps, args.gen_length, args.block_size, args.threshold
-        )
+        if args.model_type == "llada":
+            single_inference(
+                model, tokenizer, 
+                args.use_cache, args.if_cache_position, 
+                prompt, args.steps, args.gen_length, args.block_size, args.threshold
+            )
+        elif args.model_type == "llama":
+            model(m, max_new_tokens=args.gen_length)
+        else:
+            raise ValueError(f"Unknown model type {args.model_type}")
 
     total_gen_tokens = 0
     total_nfe = 0
@@ -51,11 +68,19 @@ def main(args):
     torch.cuda.synchronize()
     start_time = time.perf_counter()
     for _ in tqdm(range(args.iteration), "Real profiling..."):
-        answer, nfe = single_inference(
-            model, tokenizer, 
-            args.use_cache, args.if_cache_position, 
-            prompt, args.steps, args.gen_length, args.block_size, args.threshold
-        )
+        if args.model_type == "llada":
+            answer, nfe = single_inference(
+                model, tokenizer, 
+                args.use_cache, args.if_cache_position, 
+                prompt, args.steps, args.gen_length, args.block_size, args.threshold
+            )
+        elif args.model_type == "llama":
+            output = model(m, max_new_tokens=args.gen_length)
+            answer = output[0]["generated_text"][1]['content']
+            nfe = 0
+        else:
+            raise ValueError(f"Unknown model type {args.model_type}")
+        
         total_gen_tokens += len(tokenizer.encode(answer))
         total_nfe += nfe
 
@@ -71,7 +96,7 @@ def main(args):
 
     print("==============================================")
     print(f"Total time elapsed: {total_time:.5f}s")
-    print(f"Gen TPS: {total_gen_tokens / total_time:.2f} tokens / second")
+    print(f"Decoding TPS: {total_gen_tokens / total_time:.2f} tokens / second")
     print(f"nfe per second: {nfe / total_time:.2f} steps / second")
     print("==============================================")
 
@@ -79,6 +104,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", type=str)
+    parser.add_argument("--model_type", type=str, choices=["llada", "llama"], default="llada")
     parser.add_argument("--gen_length", type=int, default=128)
     parser.add_argument("--steps", type=int, default=128)
     parser.add_argument("--block_size", type=int, default=32)
